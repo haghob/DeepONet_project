@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from scipy.integrate import odeint
 
+# Configuration
 torch.manual_seed(42)
 np.random.seed(42)
 
@@ -38,20 +39,31 @@ class HeatControlProblem:
         u = np.zeros((self.nt, self.nx))
         u[0, :] = u0
         
-        # Schéma différences finies
+        # Schéma différences finies avec stabilité améliorée
         alpha = self.dt / (self.dx ** 2)
+        
+        # Vérification de la stabilité (condition CFL)
+        if alpha > 0.5:
+            print(f"Warning: alpha = {alpha:.4f} > 0.5, reducing time step")
+            self.dt = 0.5 * (self.dx ** 2)
+            self.t = np.linspace(0, self.T, self.nt)
+            alpha = 0.5
         
         for n in range(self.nt - 1):
             control_val = control_func(self.t[n])
             
             for i in range(1, self.nx - 1):
-                # Laplacien + terme de contrôle
+                # Laplacien + terme de contrôle avec clipping pour stabilité
                 laplacian = (u[n, i+1] - 2*u[n, i] + u[n, i-1])
-                u[n+1, i] = u[n, i] + alpha * laplacian + self.dt * control_val * u[n, i]
+                control_term = np.clip(control_val * u[n, i], -10, 10)
+                u[n+1, i] = u[n, i] + alpha * laplacian + self.dt * control_term
             
             # Conditions aux bords (Dirichlet)
             u[n+1, 0] = 0
             u[n+1, -1] = 0
+            
+            # Clipping pour éviter les valeurs explosives
+            u[n+1, :] = np.clip(u[n+1, :], -100, 100)
             
         return u
 
@@ -66,37 +78,46 @@ def generate_training_data(n_samples=100, nx=50, nt=100):
     initial_conditions = []  # Conditions initiales
     solutions = []     # Solutions u(x,t)
     
-    for _ in range(n_samples):
-        # Génère une condition initiale aléatoire
-        freq = np.random.uniform(1, 5)
-        amplitude = np.random.uniform(0.5, 2.0)
+    for idx in range(n_samples):
+        # Génère une condition initiale aléatoire (plus petite amplitude)
+        freq = np.random.uniform(1, 3)
+        amplitude = np.random.uniform(0.3, 1.0)  # Réduit pour stabilité
         u0 = amplitude * np.sin(freq * np.pi * problem.x / problem.L)
         
-        # Génère une fonction de contrôle aléatoire
+        # Génère une fonction de contrôle aléatoire (amplitude réduite)
         control_type = np.random.choice(['constant', 'linear', 'sinusoidal'])
         
         if control_type == 'constant':
-            c_val = np.random.uniform(-0.5, 0.5)
+            c_val = np.random.uniform(-0.2, 0.2)  # Réduit
             control_func = lambda t: c_val
             control_values = np.full(nt, c_val)
             
         elif control_type == 'linear':
-            slope = np.random.uniform(-1, 1)
+            slope = np.random.uniform(-0.5, 0.5)  # Réduit
             control_func = lambda t: slope * t
             control_values = slope * problem.t
             
         else:  # sinusoidal
             freq = np.random.uniform(1, 5)
-            amplitude = np.random.uniform(0.1, 0.5)
+            amplitude = np.random.uniform(0.05, 0.2)  # Réduit
             control_func = lambda t: amplitude * np.sin(2 * np.pi * freq * t)
             control_values = amplitude * np.sin(2 * np.pi * freq * problem.t)
         
         # Résout l'équation
-        u_solution = problem.solve_heat_equation(u0, control_func)
-        
-        controls.append(control_values)
-        initial_conditions.append(u0)
-        solutions.append(u_solution)
+        try:
+            u_solution = problem.solve_heat_equation(u0, control_func)
+            
+            # Vérification de validité
+            if not np.isnan(u_solution).any() and not np.isinf(u_solution).any():
+                controls.append(control_values)
+                initial_conditions.append(u0)
+                solutions.append(u_solution)
+            else:
+                print(f"Sample {idx} skipped: NaN/Inf detected")
+        except Exception as e:
+            print(f"Sample {idx} failed: {e}")
+    
+    print(f"Valid samples generated: {len(controls)}/{n_samples}")
     
     return {
         'controls': np.array(controls),
@@ -149,6 +170,16 @@ class DeepONet(nn.Module):
         self.branch = BranchNet(branch_input_dim, hidden_dim, basis_dim)
         self.trunk = TrunkNet(trunk_input_dim, hidden_dim, basis_dim)
         self.bias = nn.Parameter(torch.zeros(1))
+        
+        # Initialisation Xavier pour stabilité
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
     
     def forward(self, control, coords):
         """
@@ -180,13 +211,25 @@ def train_deeponet(model, data, epochs=1000, lr=0.001, batch_size=32):
     x_grid, t_grid = np.meshgrid(data['x'], data['t'])
     coords = np.stack([x_grid.flatten(), t_grid.flatten()], axis=1)
     
+    # Normalisation des données pour stabilité
+    controls_mean = data['controls'].mean()
+    controls_std = data['controls'].std() + 1e-8
+    controls_normalized = (data['controls'] - controls_mean) / controls_std
+    
+    solutions_mean = data['solutions'].mean()
+    solutions_std = data['solutions'].std() + 1e-8
+    solutions_normalized = (data['solutions'] - solutions_mean) / solutions_std
+    
     # Conversion en tensors
-    controls_tensor = torch.FloatTensor(data['controls'])
+    controls_tensor = torch.FloatTensor(controls_normalized)
     coords_tensor = torch.FloatTensor(coords)
-    solutions_flat = data['solutions'].reshape(n_samples, -1)
+    solutions_flat = solutions_normalized.reshape(n_samples, -1)
     solutions_tensor = torch.FloatTensor(solutions_flat)
     
     losses = []
+    best_loss = float('inf')
+    patience = 100
+    patience_counter = 0
     
     for epoch in range(epochs):
         model.train()
@@ -206,22 +249,49 @@ def train_deeponet(model, data, epochs=1000, lr=0.001, batch_size=32):
             coords_batch = coords_tensor.unsqueeze(0).repeat(len(batch_idx), 1, 1)
             pred = model(control_batch, coords_batch)
             
-            # Loss
+            # Loss avec gradient clipping
             loss = criterion(pred, solution_batch)
+            
+            # Vérification NaN
+            if torch.isnan(loss):
+                print(f"Warning: NaN loss at epoch {epoch+1}, batch {i}")
+                continue
             
             # Backward pass
             optimizer.zero_grad()
             loss.backward()
+            
+            # Gradient clipping pour stabilité
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             epoch_loss += loss.item()
             n_batches += 1
         
-        avg_loss = epoch_loss / n_batches
-        losses.append(avg_loss)
-        
-        if (epoch + 1) % 100 == 0:
-            print(f'Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.6f}')
+        if n_batches > 0:
+            avg_loss = epoch_loss / n_batches
+            losses.append(avg_loss)
+            
+            # Early stopping
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                patience_counter = 0
+            else:
+                patience_counter += 1
+            
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch+1}")
+                break
+            
+            if (epoch + 1) % 100 == 0:
+                print(f'Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.6f}')
+    
+    # Sauvegarder les paramètres de normalisation
+    model.controls_mean = controls_mean
+    model.controls_std = controls_std
+    model.solutions_mean = solutions_mean
+    model.solutions_std = solutions_std
     
     return losses
 
@@ -233,8 +303,10 @@ def visualize_results(model, data, sample_idx=0):
     """Visualise les résultats pour un échantillon"""
     model.eval()
     
-    # Préparation
-    control = torch.FloatTensor(data['controls'][sample_idx:sample_idx+1])
+    # Normalisation
+    control = (data['controls'][sample_idx:sample_idx+1] - model.controls_mean) / model.controls_std
+    control = torch.FloatTensor(control)
+    
     x_grid, t_grid = np.meshgrid(data['x'], data['t'])
     coords = np.stack([x_grid.flatten(), t_grid.flatten()], axis=1)
     coords_tensor = torch.FloatTensor(coords).unsqueeze(0)
@@ -242,7 +314,9 @@ def visualize_results(model, data, sample_idx=0):
     # Prédiction
     with torch.no_grad():
         pred = model(control, coords_tensor)
-        pred_solution = pred.squeeze().numpy().reshape(len(data['t']), len(data['x']))
+        pred_normalized = pred.squeeze().numpy().reshape(len(data['t']), len(data['x']))
+        # Dénormalisation
+        pred_solution = pred_normalized * model.solutions_std + model.solutions_mean
     
     # Solution exacte
     exact_solution = data['solutions'][sample_idx]
@@ -289,13 +363,18 @@ def visualize_results(model, data, sample_idx=0):
     axes[1, 1].legend()
     axes[1, 1].grid(True)
     
-    # Erreur relative
+    # Erreur relative avec gestion des NaN
     rel_error = np.abs(exact_solution - pred_solution) / (np.abs(exact_solution) + 1e-10)
-    axes[1, 2].hist(rel_error.flatten(), bins=50, edgecolor='black')
-    axes[1, 2].set_title('Distribution Erreur Relative')
-    axes[1, 2].set_xlabel('Erreur Relative')
-    axes[1, 2].set_ylabel('Fréquence')
-    axes[1, 2].grid(True)
+    rel_error_valid = rel_error[~np.isnan(rel_error) & ~np.isinf(rel_error)]
+    
+    if len(rel_error_valid) > 0:
+        axes[1, 2].hist(rel_error_valid.flatten(), bins=50, edgecolor='black')
+        axes[1, 2].set_title('Distribution Erreur Relative')
+        axes[1, 2].set_xlabel('Erreur Relative')
+        axes[1, 2].set_ylabel('Fréquence')
+        axes[1, 2].grid(True)
+    else:
+        axes[1, 2].text(0.5, 0.5, 'Données invalides', ha='center', va='center')
     
     plt.tight_layout()
     plt.savefig('deeponet_results.png', dpi=300, bbox_inches='tight')
@@ -304,7 +383,7 @@ def visualize_results(model, data, sample_idx=0):
     # Métriques
     mse = np.mean((exact_solution - pred_solution) ** 2)
     mae = np.mean(np.abs(exact_solution - pred_solution))
-    rel_l2 = np.linalg.norm(exact_solution - pred_solution) / np.linalg.norm(exact_solution)
+    rel_l2 = np.linalg.norm(exact_solution - pred_solution) / (np.linalg.norm(exact_solution) + 1e-10)
     
     print(f"\n{'='*50}")
     print(f"MÉTRIQUES DE PERFORMANCE")
@@ -342,16 +421,19 @@ if __name__ == "__main__":
     print("\n[3/4] Entraînement du modèle...")
     losses = train_deeponet(model, data, epochs=1000, lr=0.001, batch_size=32)
     
-    plt.figure(figsize=(10, 5))
-    plt.plot(losses)
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Courbe d\'Apprentissage')
-    plt.grid(True)
-    plt.yscale('log')
-    plt.savefig('training_loss.png', dpi=300, bbox_inches='tight')
-    plt.show()
+    # Plot des losses
+    if len(losses) > 0:
+        plt.figure(figsize=(10, 5))
+        plt.plot(losses)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Courbe d\'Apprentissage')
+        plt.grid(True)
+        plt.yscale('log')
+        plt.savefig('training_loss.png', dpi=300, bbox_inches='tight')
+        plt.show()
     
+    # 4. Visualisation
     print("\n[4/4] Génération des visualisations...")
     visualize_results(model, data, sample_idx=0)
     
